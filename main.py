@@ -1,30 +1,41 @@
 """
-Desktop Postflop automator (Board grid detection, supports fixed selected cards)
+Desktop Postflop automator (Board grid detection + robust OOP option selection)
 
 Use case:
 - You manually keep 2 fixed cards selected (any suit rows).
 - Script cycles a third card across one suit row (A..2), keeping the fixed cards selected.
 - No reliance on card templates (selected state can change appearance).
 
-How it works:
-- Anchors on the "Board" title in the main panel via template (stable UI text).
+Board selection:
+- Anchors on the main panel "Board" title via template.
 - Crops a region below it where the 4 suit rows exist.
 - Uses OpenCV to detect card rectangles (borders), independent of fill color (yellow selection).
 - Sorts rectangles into 4 rows x 13 columns and clicks the target cell center.
 
-Dependencies:
+OOP selection in Results:
+- Locates the OOP panel box using two possible templates:
+  - oop_panel_box_big.png (when nothing is selected yet)
+  - oop_panel_box_small.png (after an option is selected)
+- Clicks row 1, screenshot, row 2, screenshot, row 3, screenshot.
+- Click points are computed proportionally inside the located panel box, so it works in both sizes.
+
+Dependencies (Windows):
 pip install pyautogui opencv-python pillow numpy pygetwindow
 
 Templates needed in ./templates:
-- panel_board_title.png   (crop of the "Board" title in the MAIN panel, not side menu, neutral state)
+Board navigation and solver:
+- panel_board_title.png      (crop of the "Board" title in the MAIN panel)
 - menu_run_solver.png
 - btn_build_new_tree.png
 - btn_run_solver.png
 - solver_finished.png
 - top_results.png
-- oop_label.png
 - top_solver.png
-- menu_board.png          (optional best-effort)
+- menu_board.png             (optional best-effort)
+
+OOP panel (Results):
+- oop_panel_box_big.png      (OOP panel when nothing selected; like your image 1)
+- oop_panel_box_small.png    (OOP panel after selection; like your image 2)
 """
 
 import os
@@ -60,10 +71,6 @@ class Config:
     after_navigation_sleep_sec: float = 0.55
     after_solver_start_sleep_sec: float = 1.0
 
-    # Results -> OOP options positions relative to "OOP" label
-    oop_first_row_offset_y: int = 55
-    oop_row_step_y: int = 24
-
     # Board grid crop relative to the "Board" title in main panel
     # You may tweak these once if needed.
     grid_offset_x: int = -10
@@ -79,11 +86,16 @@ class Config:
 
     # Cycle behavior
     ranks_in_order: List[str] = None
-    suit_row_to_cycle: str = "S"  # "S", "H", "D", "C" (row order in UI is assumed S,H,D,C top->bottom)
+    suit_row_to_cycle: str = "S"  # "S", "H", "D", "C" (row order assumed S,H,D,C top->bottom)
     deselect_previous_cycle_card: bool = True
 
     # If detection fails, retry how many times
     grid_detect_retries: int = 3
+
+    # OOP panel click behavior
+    oop_click_x_ratio: float = 0.12       # click near colored square area (left side inside panel)
+    oop_header_ratio: float = 0.28        # portion for the "OOP" header area
+    oop_rows: int = 3
 
 
 CFG = Config(
@@ -205,34 +217,16 @@ def go_to_results() -> None:
     time.sleep(CFG.after_navigation_sleep_sec)
 
 
-def click_oop_options_and_screenshot(card_id: str, out_dir: str) -> None:
-    x, y, _ = locate_center(template_path("oop_label.png"), timeout_sec=CFG.locate_timeout_sec)
-    base_x = x + 60
-
-    for idx in range(3):
-        row_y = y + CFG.oop_first_row_offset_y + idx * CFG.oop_row_step_y
-        click_point(base_x, row_y)
-        time.sleep(0.35)
-        out_path = os.path.join(out_dir, f"{card_id}_opt{idx+1}.png")
-        take_screenshot(out_path)
-
-
 def _grab_screen_bgr() -> np.ndarray:
     img = np.array(ImageGrab.grab())
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
 def _detect_card_rects_in_grid(grid_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """
-    Detect card rectangles using edges/contours. Works even if cards are yellow/selected.
-    Returns list of (x,y,w,h) in grid coordinates.
-    """
     gray = cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2GRAY)
-    # Emphasize borders
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(blur, 40, 120)
 
-    # Close gaps in borders
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -242,11 +236,9 @@ def _detect_card_rects_in_grid(grid_bgr: np.ndarray) -> List[Tuple[int, int, int
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         if (CFG.min_card_w <= w <= CFG.max_card_w) and (CFG.min_card_h <= h <= CFG.max_card_h):
-            # Basic shape sanity: cards should be taller than wide
             if h > w:
                 rects.append((x, y, w, h))
 
-    # Remove near-duplicates by IOU-like grouping (simple)
     rects = sorted(rects, key=lambda r: (r[1], r[0]))
     filtered = []
     for r in rects:
@@ -263,35 +255,28 @@ def _detect_card_rects_in_grid(grid_bgr: np.ndarray) -> List[Tuple[int, int, int
 
 
 def _cluster_rows(rects: List[Tuple[int, int, int, int]], n_rows: int = 4) -> List[List[Tuple[int, int, int, int]]]:
-    """
-    Cluster rectangles into rows by their y-centers.
-    """
     if not rects:
         return []
 
-    # Compute y centers
     items = [(r, r[1] + r[3] / 2.0) for r in rects]
     items.sort(key=lambda t: t[1])
 
-    # Greedy clustering by proximity
     rows: List[List[Tuple[int, int, int, int]]] = []
     for r, yc in items:
         placed = False
         for row in rows:
-            row_yc = np.mean([rr[1] + rr[3] / 2.0 for rr in row])
-            if abs(yc - row_yc) < 25:  # row separation threshold
+            row_yc = float(np.mean([rr[1] + rr[3] / 2.0 for rr in row]))
+            if abs(yc - row_yc) < 25:
                 row.append(r)
                 placed = True
                 break
         if not placed:
             rows.append([r])
 
-    # Sort rows by y and keep the best 4 (closest to 13 items)
-    rows.sort(key=lambda row: np.mean([rr[1] + rr[3] / 2.0 for rr in row]))
+    rows.sort(key=lambda row: float(np.mean([rr[1] + rr[3] / 2.0 for rr in row])))
     rows = sorted(rows, key=lambda row: abs(len(row) - 13))[:n_rows]
-    rows.sort(key=lambda row: np.mean([rr[1] + rr[3] / 2.0 for rr in row]))
+    rows.sort(key=lambda row: float(np.mean([rr[1] + rr[3] / 2.0 for rr in row])))
 
-    # Sort each row by x
     for i in range(len(rows)):
         rows[i] = sorted(rows[i], key=lambda rr: rr[0])
 
@@ -299,11 +284,6 @@ def _cluster_rows(rects: List[Tuple[int, int, int, int]], n_rows: int = 4) -> Li
 
 
 def get_grid_centers() -> List[List[Tuple[int, int]]]:
-    """
-    Returns centers for 4 rows x 13 cols in ABSOLUTE screen coordinates.
-    Row order assumption: [Spades, Hearts, Diamonds, Clubs] top->bottom
-    """
-    # Anchor on the main panel title "Board"
     _, _, board_title_box = locate_center(template_path("panel_board_title.png"), timeout_sec=CFG.locate_timeout_sec)
 
     grid_left = int(board_title_box.left + CFG.grid_offset_x)
@@ -317,7 +297,6 @@ def get_grid_centers() -> List[List[Tuple[int, int]]]:
     rects = _detect_card_rects_in_grid(grid_bgr)
     rows = _cluster_rows(rects, n_rows=4)
 
-    # Validate: need 4 rows and each close to 13
     if len(rows) != 4:
         raise RuntimeError(f"Grid detection failed: found {len(rows)} rows (expected 4).")
 
@@ -325,7 +304,6 @@ def get_grid_centers() -> List[List[Tuple[int, int]]]:
     for row in rows:
         if len(row) < 10:
             raise RuntimeError(f"Grid detection failed: a row has only {len(row)} rects.")
-        # keep leftmost 13 if extras
         row = row[:13]
         row_centers = []
         for x, y, w, h in row:
@@ -334,17 +312,65 @@ def get_grid_centers() -> List[List[Tuple[int, int]]]:
             row_centers.append((cx, cy))
         centers.append(row_centers)
 
-    # If a row has not exactly 13, normalize by trimming to 13
     centers = [row[:13] for row in centers]
     return centers
 
 
 def suit_row_index(letter: str) -> int:
-    # Assumed UI order (your screenshot): Spades, Hearts, Diamonds, Clubs
     m = {"S": 0, "H": 1, "D": 2, "C": 3}
     if letter not in m:
         raise ValueError("suit_row_to_cycle must be one of: S, H, D, C")
     return m[letter]
+
+
+def locate_oop_panel_box() -> Any:
+    """
+    OOP panel can appear in two sizes/states:
+    - big: when nothing is selected yet
+    - small: after selecting an option
+    Try both quickly, then fall back to normal timeout.
+    """
+    for name in ("oop_panel_box_big.png", "oop_panel_box_small.png"):
+        try:
+            _, _, box = locate_center(template_path(name), timeout_sec=2.5)
+            return box
+        except TimeoutError:
+            pass
+
+    _, _, box = locate_center(template_path("oop_panel_box_small.png"), timeout_sec=CFG.locate_timeout_sec)
+    return box
+
+
+def click_oop_options_and_screenshot(card_id: str, out_dir: str) -> None:
+    """
+    Select OOP option 1, screenshot, option 2, screenshot, option 3, screenshot.
+
+    Uses the OOP panel box position and proportional row geometry, so it works in both:
+    - big panel (none selected)
+    - small panel (after selection)
+    """
+    box = locate_oop_panel_box()
+
+    left = box.left
+    top = box.top
+    w = box.width
+    h = box.height
+
+    click_x = int(left + max(12, w * CFG.oop_click_x_ratio))
+
+    header_h = int(h * CFG.oop_header_ratio)
+    rows_area_h = max(1, h - header_h)
+
+    row_centers_y = []
+    for i in range(CFG.oop_rows):
+        ry = top + header_h + int((i + 0.5) * (rows_area_h / float(CFG.oop_rows)))
+        row_centers_y.append(ry)
+
+    for idx, ry in enumerate(row_centers_y, start=1):
+        click_point(click_x, int(ry))
+        time.sleep(0.35)
+        out_path = os.path.join(out_dir, f"{card_id}_opt{idx}.png")
+        take_screenshot(out_path)
 
 
 def main() -> None:
@@ -354,7 +380,6 @@ def main() -> None:
     out_dir = os.path.join(CFG.output_root, run_id)
     ensure_dir(out_dir)
 
-    # Avoid hover-state mismatches
     pyautogui.moveTo(10, 10)
     time.sleep(0.2)
 
@@ -366,10 +391,8 @@ def main() -> None:
         card_id = f"{rank}{CFG.suit_row_to_cycle}"
         print(f"[{ts()}] Processing {card_id}")
 
-        # Make sure we are on Board (best effort)
         ensure_board_screen_best_effort()
 
-        # Detect grid centers (retry a few times if needed)
         last_err = None
         centers = None
         for _ in range(CFG.grid_detect_retries):
@@ -383,27 +406,22 @@ def main() -> None:
         if centers is None:
             raise RuntimeError(f"Could not detect board grid. Last error: {last_err}")
 
-        # Deselect previous cycle card only (do NOT clear fixed cards)
         if CFG.deselect_previous_cycle_card and prev_cycle_center is not None:
             px, py = prev_cycle_center
             click_point(px, py)
             time.sleep(0.12)
 
-        # Select current cycle card in the chosen suit row and rank column
         cx, cy = centers[row_idx][rank_idx]
         click_point(cx, cy)
         time.sleep(0.25)
 
         prev_cycle_center = (cx, cy)
 
-        # Solve
         run_solver_cycle_for_current_board()
 
-        # Results + screenshots
         go_to_results()
         click_oop_options_and_screenshot(card_id=card_id, out_dir=out_dir)
 
-        # Back to Board for next iteration
         ensure_board_screen_best_effort()
 
     print(f"[{ts()}] Done. Screenshots saved in: {os.path.abspath(out_dir)}")
